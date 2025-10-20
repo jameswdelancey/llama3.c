@@ -506,10 +506,22 @@ void encode(Tokenizer *t, char *text, int8_t bos, int8_t eos, int *tokens, int *
     qsort(t->sorted_vocab, t->vocab_size, sizeof(TokenIndex), compare_tokens);
   }
 
-  // create a temporary buffer that will store merge candidates of always two consecutive tokens
-  // *2 for concat, +1 for null terminator +2 for UTF8 (in case max_token_length is 1)
-  char *str_buffer = malloc((t->max_token_length * 2 + 1 + 2) * sizeof(char));
-  size_t str_len = 0;
+  // create buffers for UTF-8 codepoints and candidate merges. utf8_codepoint holds up to 4 bytes
+  // (maximum UTF-8 length) plus a null terminator. merge_buffer stores concatenations of up to
+  // three tokens, which is required when looking for the best merge candidate. ensure the buffer
+  // is also large enough to store at least one UTF-8 codepoint to handle vocabularies with very
+  // small max_token_length values.
+  char utf8_codepoint[5];
+  size_t codepoint_len = 0;
+  size_t merge_buffer_size = (size_t)t->max_token_length * 3 + 1;
+  if (merge_buffer_size < sizeof(utf8_codepoint)) {
+    merge_buffer_size = sizeof(utf8_codepoint);
+  }
+  char *merge_buffer = malloc(merge_buffer_size);
+  if (merge_buffer == NULL) {
+    fprintf(stderr, "malloc failed!\n");
+    exit(EXIT_FAILURE);
+  }
 
   // start at 0 tokens
   *n_tokens = 0;
@@ -532,7 +544,7 @@ void encode(Tokenizer *t, char *text, int8_t bos, int8_t eos, int *tokens, int *
   // U+10000	U+10FFFF    11110xxx	10xxxxxx	10xxxxxx	10xxxxxx
 
   // process the raw (UTF-8) byte sequence of the input string
-  for (char *c = text; *c != '\0'; c++) {
+  for (unsigned char *c = (unsigned char *)text; *c != '\0'; c++) {
 
     // reset buffer if the current byte is ASCII or a leading byte
     // 0xC0 is 11000000, so (*c & 0xC0) keeps the first 2 bits and zeros the rest
@@ -542,21 +554,30 @@ void encode(Tokenizer *t, char *text, int8_t bos, int8_t eos, int *tokens, int *
     if ((*c & 0xC0) != 0x80) {
       // this byte must be either a leading byte (11...) or an ASCII char (0x...)
       // => reset our location, as we're starting a new UTF-8 codepoint
-      str_len = 0;
+      codepoint_len = 0;
+    }
+
+    // if the UTF-8 sequence is unexpectedly long, fall back to encoding the bytes we have so far
+    if (codepoint_len >= sizeof(utf8_codepoint) - 1) {
+      for (size_t i = 0; i < codepoint_len; i++) {
+        tokens[(*n_tokens)++] = (unsigned char)utf8_codepoint[i] + 3;
+      }
+      codepoint_len = 0;
     }
 
     // append the current byte to the buffer
-    str_buffer[str_len++] = *c; // ++ is post-increment, incremented after this line
-    str_buffer[str_len] = '\0';
+    utf8_codepoint[codepoint_len++] = (char)(*c); // ++ is post-increment, incremented after this line
+    utf8_codepoint[codepoint_len] = '\0';
 
     // while the next character is a continuation byte, continue appending
     // but if there are too many of them, just stop to avoid overruning str_buffer size.
-    if ((*(c + 1) & 0xC0) == 0x80 && str_len < 4) {
+    unsigned char next_byte = *(c + 1);
+    if ((next_byte & 0xC0) == 0x80 && codepoint_len < 4) {
       continue;
     }
 
     // ok c+1 is not a continuation byte, so we've read in a full codepoint
-    int id = str_lookup(str_buffer, t->sorted_vocab, t->vocab_size);
+    int id = str_lookup(utf8_codepoint, t->sorted_vocab, t->vocab_size);
 
     if (id != -1) {
       // we found this codepoint in vocab, add it as a token
@@ -565,11 +586,11 @@ void encode(Tokenizer *t, char *text, int8_t bos, int8_t eos, int *tokens, int *
       // byte_fallback encoding: just encode each byte as a token
       // +3 is here because the first 3 vocab elements are <unk>, <s>, </s>
       // so the individual bytes only start at index 3
-      for (int i = 0; i < str_len; i++) {
-        tokens[(*n_tokens)++] = (unsigned char)str_buffer[i] + 3;
+      for (size_t i = 0; i < codepoint_len; i++) {
+        tokens[(*n_tokens)++] = (unsigned char)utf8_codepoint[i] + 3;
       }
     }
-    str_len = 0; // protect against a sequence of stray UTF8 continuation bytes
+    codepoint_len = 0; // protect against a sequence of stray UTF8 continuation bytes
   }
 
   // merge the best consecutive pair or triple each iteration, according to the scores in vocab_scores
@@ -582,8 +603,11 @@ void encode(Tokenizer *t, char *text, int8_t bos, int8_t eos, int *tokens, int *
     // first, try to find the best pair to merge
     for (int i = 0; i < (*n_tokens - 1); i++) {
       // check if we can merge the pair (tokens[i], tokens[i+1])
-      sprintf(str_buffer, "%s%s", t->vocab[tokens[i]], t->vocab[tokens[i + 1]]);
-      int id = str_lookup(str_buffer, t->sorted_vocab, t->vocab_size);
+      int written = snprintf(merge_buffer, merge_buffer_size, "%s%s", t->vocab[tokens[i]], t->vocab[tokens[i + 1]]);
+      if (written < 0 || (size_t)written >= merge_buffer_size) {
+        continue;
+      }
+      int id = str_lookup(merge_buffer, t->sorted_vocab, t->vocab_size);
       if (id != -1 && t->vocab_scores[id] > best_score) {
         // this merge pair exists in vocab! record its score and position
         best_score = t->vocab_scores[id];
@@ -596,8 +620,11 @@ void encode(Tokenizer *t, char *text, int8_t bos, int8_t eos, int *tokens, int *
     if (best_idx == -1) {
       for (int i = 0; i < (*n_tokens - 2); i++) {
         // check if we can merge the triple (tokens[i], tokens[i+1], tokens[i+2])
-        sprintf(str_buffer, "%s%s%s", t->vocab[tokens[i]], t->vocab[tokens[i + 1]], t->vocab[tokens[i + 2]]);
-        int id = str_lookup(str_buffer, t->sorted_vocab, t->vocab_size);
+        int written = snprintf(merge_buffer, merge_buffer_size, "%s%s%s", t->vocab[tokens[i]], t->vocab[tokens[i + 1]], t->vocab[tokens[i + 2]]);
+        if (written < 0 || (size_t)written >= merge_buffer_size) {
+          continue;
+        }
+        int id = str_lookup(merge_buffer, t->sorted_vocab, t->vocab_size);
         if (id != -1 && t->vocab_scores[id] > best_score) {
           // this merge triple exists in vocab! record its score and position
           best_score = t->vocab_scores[id];
@@ -625,7 +652,7 @@ void encode(Tokenizer *t, char *text, int8_t bos, int8_t eos, int *tokens, int *
   if (eos)
     tokens[(*n_tokens)++] = 128001;
 
-  free(str_buffer);
+  free(merge_buffer);
 }
 
 // ----------------------------------------------------------------------------
