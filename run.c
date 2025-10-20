@@ -7,6 +7,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <stdint.h>
+#if defined(LLAMA_USE_MKL)
+#include <mkl_cblas.h>
+#define LLAMA_USE_CBLAS 1
+#elif defined(LLAMA_USE_OPENBLAS) || defined(LLAMA_USE_ACCELERATE)
+#include <cblas.h>
+#define LLAMA_USE_CBLAS 1
+#endif
+#ifndef LLAMA_USE_CBLAS
+#define LLAMA_USE_CBLAS 0
+#endif
 #if defined _WIN32
 #include "win.h"
 #else
@@ -232,9 +243,12 @@ void softmax(float *x, int size) {
   }
 }
 
-void matmul(float *xout, float *x, float *w, int n, int d) {
+void matmul(float *xout, const float *x, const float *w, int n, int d) {
   // W (d,n) @ x (n,) -> xout (d,)
   // by far the most amount of time is spent inside this little function
+#if LLAMA_USE_CBLAS
+  cblas_sgemv(CblasRowMajor, CblasNoTrans, d, n, 1.0f, w, n, x, 1, 0.0f, xout, 1);
+#else
   int i;
 #pragma omp parallel for private(i)
   for (i = 0; i < d; i++) {
@@ -244,6 +258,7 @@ void matmul(float *xout, float *x, float *w, int n, int d) {
     }
     xout[i] = val;
   }
+#endif
 }
 
 float *forward(Transformer *transformer, int token, int pos) {
