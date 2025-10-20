@@ -65,6 +65,36 @@ gcc -Ofast run.c -o run
 $ gcc -Ofast -fopenmp -march=native run.c win.c -o run
 ```
 
+## performance experiments with batched sgemm
+
+Community experiments have shown that linking `run.c` against a high performance
+BLAS implementation can dramatically increase both prompt processing and token
+generation throughput on CPU-only systems. In particular, a fork that wires
+Intel MKL 2023.1.0 into the attention and prompt-processing paths via
+`cblas_sgemm_batched()` reports the following single-threaded results on a Ryzen
+7 5800X when using GCC 14.1.1 and the prompt from the example below:
+
+| build | prompt tokens/s | generated tokens/s |
+|-------|-----------------|--------------------|
+| baseline `run` | ~1.0 | ~1.0 |
+| MKL fork | 53.70 | 1.33 |
+| llama.cpp (for reference) | 46.14 | 1.29 |
+
+The gains primarily come from:
+
+- A dedicated prompt-processing routine that parallelizes per-token matrix work
+  with batched GEMM calls.
+- Rewriting the attention path to rely on `cblas_sgemm_batched()`.
+- Avoiding redundant computations inside the transformer loop and measuring the
+  full prompt window instead of skipping the first token.
+
+The fork also provides experimental OpenBLAS and standalone back ends. However,
+the OpenBLAS path currently regresses token generation throughput unless
+`forward()` falls back to the original `matmul()` routine, and the standalone
+path lacks an optimized SGEMM kernel. Further work on custom SGEMM
+implementations could enable additional optimizations such as fusing softmax
+preparation into the matrix multiply.
+
 # base model single shot
 This still runs at interactive rates and samples more coherent and diverse stories:
 
