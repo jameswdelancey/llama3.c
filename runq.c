@@ -9,6 +9,7 @@
 #include <string.h>
 #include <time.h>
 #if defined _WIN32
+#include <io.h>
 #include "win.h"
 #else
 #include <sys/mman.h>
@@ -612,6 +613,39 @@ void safe_printf(char *piece) {
       return; // bad byte, don't print it
     }
   }
+#if defined _WIN32
+  static int console_checked = 0;
+  static int console_is_tty = 0;
+  static HANDLE console_handle = NULL;
+  if (!console_checked) {
+    console_handle = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (console_handle != NULL && console_handle != INVALID_HANDLE_VALUE &&
+        GetFileType(console_handle) == FILE_TYPE_CHAR && _isatty(_fileno(stdout))) {
+      console_is_tty = 1;
+    }
+    console_checked = 1;
+  }
+  if (console_is_tty) {
+    int len = (int)strlen(piece);
+    if (len == 0) {
+      return;
+    }
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, piece, len, NULL, 0);
+    if (wlen > 0) {
+      wchar_t *wbuf = (wchar_t *)malloc(sizeof(wchar_t) * wlen);
+      if (wbuf != NULL) {
+        MultiByteToWideChar(CP_UTF8, 0, piece, len, wbuf, wlen);
+        DWORD written;
+        WriteConsoleW(console_handle, wbuf, wlen, &written, NULL);
+        free(wbuf);
+        return;
+      }
+    }
+    DWORD written;
+    WriteConsoleA(console_handle, piece, len, &written, NULL);
+    return;
+  }
+#endif
   printf("%s", piece);
 }
 
@@ -1144,6 +1178,12 @@ int main(int argc, char *argv[]) {
   unsigned long long rng_seed = 0; // seed rng with time by default
   char *mode = "generate";         // generate|chat
   char *system_prompt = NULL;      // the (optional) system prompt to use in chat mode
+
+  // ensure Windows console interprets UTF-8 correctly
+#if defined _WIN32
+  SetConsoleOutputCP(CP_UTF8);
+  SetConsoleCP(CP_UTF8);
+#endif
 
   // poor man's C argparse so we can override the defaults above from the command line
   if (argc >= 2) {
